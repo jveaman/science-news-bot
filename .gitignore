@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+.env
+science_bot.db
+*.sqlite
+*.log
+.vscode/
