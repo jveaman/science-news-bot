@@ -1,0 +1,6 @@
+{
+  "RECENCY_DAYS": 7,
+  "ALLOWED_DOMAINS": ["arxiv.org", "nature.com", "science.org"],
+  "BLOCK_KEYWORDS": ["quantum healing"],
+  "RSS_SOURCES": {}
+}
