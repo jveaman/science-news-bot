@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup
 import tweepy
 from dotenv import load_dotenv
 import tldextract
-from openai import OpenAI
+import openai
 
 FOCUS_HASHTAGS = [
     "#AI", "#QuantumComputing", "#Fusion", "#Longevity", "#Aging", "#Neuroscience",
@@ -156,12 +156,15 @@ def gather_items(source_keys: List[str]):
     return uniq
 
 # ---------- Summarization ----------
-def build_summary(client: OpenAI, title: str, text: str, url: str, lang: str = "en") -> str:
+def build_summary(title: str, text: str, url: str, lang: str = "en") -> str:
     prompt = f"""You are a concise science editor. Write exactly TWO sentences in {lang}. Be clear, neutral, and specific. Keep it under 220 characters if possible. Mention the domain (AI/quantum/fusion/longevity/BMI) when obvious, avoid hype. If source is a preprint, begin with 'Preprint:'.\nTitle: {title}\nArticle text:\n{text[:6000]}"""
-    resp = client.chat.completions.create(
+    # Use the openai module (classic ChatCompletion path) to avoid client constructor issues.
+    resp = openai.ChatCompletion.create(
         model="gpt-5.1-mini",
-        messages=[{"role": "system", "content": "You write crisp, factual science summaries in exactly two sentences."},
-                 {"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": "You write crisp, factual science summaries in exactly two sentences."},
+            {"role": "user", "content": prompt}
+        ],
         temperature=0.3,
         max_tokens=140,
     )
@@ -192,8 +195,8 @@ def craft_tweet(title: str, url: str, summary: str) -> str:
 def run(max_posts=10, lang="en", post=False, source_keys=None, dry_run=False):
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-    # Let the OpenAI library read the API key from the environment (OPENAI_API_KEY)
-    client = OpenAI()
+    # Use the openai module and read API key from the environment
+    openai.api_key = os.environ.get("OPENAI_API_KEY")
     conn = ensure_db()
 
     if source_keys is None or source_keys == ["all"]:
@@ -219,7 +222,7 @@ def run(max_posts=10, lang="en", post=False, source_keys=None, dry_run=False):
             continue
 
         try:
-            summary = build_summary(client, title, article_text, link, lang)
+            summary = build_summary(title, article_text, link, lang)
         except Exception as ex:
             logging.warning("Summarization failed: %s", ex)
             continue
