@@ -1,19 +1,29 @@
 """
-Science News Twitter Bot (Upgraded)
+Science News Twitter Bot (REST OpenAI + Policy Safe)
 
-Adds:
-- Domain allowlist (trusted science sources)
-- Keyword blocklist (exclude fringe)
-- Preprint labeling for arXiv
-- Recency filter (skip >7 days old)
-
-Posts 10 curated science/tech headlines daily with 2‑sentence summaries and source links.
-Focus areas: AI, quantum, fusion, longevity/biotech, brain‑machine interfaces.
+Features:
+- Pulls curated RSS feeds (AI, quantum, fusion, longevity, BMI)
+- Allowlist of reputable domains + fringe keyword blocklist
+- 7-day recency filter (configurable)
+- Labels arXiv items as [Preprint]
+- Uses OpenAI Chat Completions via REST (requests) to avoid SDK constructor issues in Actions
+- SQLite dedupe store
+- Dry-run mode for previews and real post mode using Tweepy (OAuth1)
 """
 from __future__ import annotations
-import os, sys, re, time, json, textwrap, argparse, sqlite3, random, logging
+import os
+import sys
+import re
+import time
+import json
+import textwrap
+import argparse
+import sqlite3
+import random
+import logging
+import traceback
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import feedparser
 import requests
@@ -21,7 +31,8 @@ from bs4 import BeautifulSoup
 import tweepy
 from dotenv import load_dotenv
 import tldextract
-from openai import OpenAI
+
+# ---------------- Config / Defaults ----------------
 
 FOCUS_HASHTAGS = [
     "#AI", "#QuantumComputing", "#Fusion", "#Longevity", "#Aging", "#Neuroscience",
@@ -59,7 +70,35 @@ MAX_TWEET_LEN = 280
 DB_PATH = os.environ.get("SCI_BOT_DB", "science_bot.db")
 USER_AGENT = "SciNewsBot/1.0 (https://github.com/)"
 
-# ---------- Helpers ----------
+# OpenAI REST config
+OPENAI_API_URL = os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # must be set as secret in Actions
+OPENAI_MODEL = os.environ.get("SCI_BOT_MODEL", "gpt-3.5-turbo")
+OPENAI_TIMEOUT = int(os.environ.get("SCI_BOT_OPENAI_TIMEOUT", 30))
+
+# Optional config overrides (config.json)
+CONFIG_PATH = os.environ.get("SCI_BOT_CONFIG", "config.json")
+
+def load_config_overrides():
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if "ALLOWED_DOMAINS" in cfg:
+                ALLOWED_DOMAINS.update(set(cfg["ALLOWED_DOMAINS"]))
+            if "BLOCK_KEYWORDS" in cfg:
+                BLOCK_KEYWORDS.update(set(cfg["BLOCK_KEYWORDS"]))
+            if "RSS_SOURCES" in cfg and isinstance(cfg["RSS_SOURCES"], dict):
+                RSS_SOURCES.update(cfg["RSS_SOURCES"])
+            if "RECENCY_DAYS" in cfg:
+                global RECENCY_DAYS
+                RECENCY_DAYS = int(cfg["RECENCY_DAYS"])
+    except Exception as ex:
+        logging.warning("Config override failed: %s", ex)
+
+RECENCY_DAYS = int(os.environ.get("SCI_BOT_RECENCY_DAYS", 7))
+
+# ---------------- Helpers ----------------
 
 def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
@@ -75,7 +114,25 @@ def domain_hashtag(url: str) -> str:
     except Exception:
         return ""
 
-# ---------- Storage ----------
+def is_preprint(url: str) -> bool:
+    return "arxiv.org" in url
+
+def allowed_by_policy(url: str, title: str, body: str, published: Optional[datetime]) -> bool:
+    try:
+        ext = tldextract.extract(url)
+        domain = ".".join([d for d in [ext.domain, ext.suffix] if d])
+    except Exception:
+        domain = ""
+    if domain not in ALLOWED_DOMAINS:
+        return False
+    lt = (title + " " + body[:400]).lower()
+    if any(k in lt for k in BLOCK_KEYWORDS):
+        return False
+    if published and published < datetime.now(timezone.utc) - timedelta(days=RECENCY_DAYS):
+        return False
+    return True
+
+# ---------------- Storage (SQLite) ----------------
 
 def ensure_db():
     conn = sqlite3.connect(DB_PATH)
@@ -99,35 +156,24 @@ def mark_posted(conn, url: str, title: str):
                 (url, title, datetime.now(timezone.utc).isoformat()))
     conn.commit()
 
-# ---------- Filters ----------
-
-def is_allowed(url: str, title: str, body: str, published: datetime | None) -> bool:
-    ext = tldextract.extract(url)
-    domain = ".".join([d for d in [ext.domain, ext.suffix] if d])
-    if domain not in ALLOWED_DOMAINS:
-        return False
-    lt = (title + " " + body[:400]).lower()
-    if any(k in lt for k in BLOCK_KEYWORDS):
-        return False
-    if published and published < datetime.now(timezone.utc) - timedelta(days=7):
-        return False
-    return True
-
-# ---------- Fetching ----------
+# ---------------- Fetching ----------------
 
 def fetch_article_text(url: str, timeout: int = 15) -> str:
+    """Fetch and extract main article text; return empty string on failure."""
     try:
         headers = {"User-Agent": USER_AGENT}
         r = requests.get(url, headers=headers, timeout=timeout)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        selectors = ["article","div.article-body","div#content","div.post-content","main"]
+        selectors = ["article", "div.article-body", "div#content", "div.post-content", "main"]
         for sel in selectors:
             el = soup.select_one(sel)
             if el and len(el.get_text(strip=True)) > 200:
                 return clean_text(el.get_text(" "))
+        # fallback: full text
         return clean_text(soup.get_text(" "))
-    except Exception:
+    except Exception as e:
+        logging.debug("fetch_article_text failed for %s: %s", url, e)
         return ""
 
 def gather_items(source_keys: List[str]):
@@ -136,53 +182,97 @@ def gather_items(source_keys: List[str]):
         for feed in RSS_SOURCES.get(key, []):
             try:
                 fp = feedparser.parse(feed)
-                for e in fp.entries[:20]:
+                for e in fp.entries[:30]:
                     title = clean_text(e.get("title", "").strip())
                     link = e.get("link")
                     published = None
                     if hasattr(e, 'published_parsed') and e.published_parsed:
                         published = datetime.fromtimestamp(time.mktime(e.published_parsed), tz=timezone.utc)
+                    # store feed summary as fallback
+                    summary = e.get("summary", "") or e.get("description", "")
                     if title and link:
-                        items.append((title, link, key, published))
+                        items.append((title, link, key, published, summary))
             except Exception as ex:
                 logging.warning("Feed error %s: %s", feed, ex)
+    # de-duplicate
     seen = set()
     uniq = []
-    for t, l, k, p in items:
+    for t, l, k, p, s in items:
         if l not in seen:
-            uniq.append((t, l, k, p))
+            uniq.append((t, l, k, p, s))
             seen.add(l)
     random.shuffle(uniq)
     return uniq
 
-# ---------- Summarization ----------
-def build_summary(client: OpenAI, title: str, text: str, url: str, lang: str = "en") -> str:
+# ---------------- Summarization (OpenAI REST) ----------------
+
+def build_summary(title: str, text: str, url: str, lang: str = "en", preprint: bool = False) -> str:
+    """
+    Use OpenAI Chat Completions API via REST to return a two-sentence summary.
+    Returns empty string on failure.
+    """
+    if not OPENAI_API_KEY:
+        logging.error("OPENAI_API_KEY not set.")
+        return ""
+
     prompt = (
         f"You are a concise science editor. Write exactly TWO sentences in {lang}. "
-        "Be clear, neutral, and specific. Keep it under 220 characters if possible. "
-        "Mention the domain (AI/quantum/fusion/longevity/BMI) when obvious, avoid hype. "
-        "If source is a preprint, begin with 'Preprint:'.\n"
+        "Be clear, neutral, and specific. Avoid hype. State what was done/found and under what conditions. "
+        "Keep it under 220 characters if possible. "
+        "Mention the domain (AI/quantum/fusion/longevity/BMI) when obvious. "
+        "If source is a preprint, begin the first sentence with 'Preprint:'.\n"
         f"Title: {title}\nArticle text:\n{text[:6000]}"
     )
-    resp = client.chat.completions.create(
-        model="gpt-3.5-turbo",   # safe fallback — change if you have access to a different model
-        messages=[
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
             {"role": "system", "content": "You write crisp, factual science summaries in exactly two sentences."},
             {"role": "user", "content": prompt},
         ],
-        temperature=0.3,
-        max_tokens=140,
-    )
+        "temperature": 0.3,
+        "max_tokens": 140,
+    }
 
-    # response parsing for the OpenAI client
     try:
-        content = resp.choices[0].message["content"]
-    except Exception:
-        # defensive — some SDK versions return different shapes
-        content = resp.choices[0].get("message", {}).get("content") or str(resp)
+        resp = requests.post(f"{OPENAI_API_URL}/chat/completions", headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
+        resp.raise_for_status()
+    except Exception as e:
+        logging.warning("OpenAI request failed: %s", e)
+        try:
+            logging.debug("OpenAI response text: %s", resp.text)
+        except Exception:
+            pass
+        return ""
+
+    try:
+        data = resp.json()
+        # robust extraction of content
+        content = ""
+        if "choices" in data and len(data["choices"]) > 0:
+            choice = data["choices"][0]
+            if isinstance(choice.get("message"), dict):
+                content = choice["message"].get("content", "")
+            else:
+                content = choice.get("text", "")
+        else:
+            content = ""
+    except Exception as e:
+        logging.warning("Failed to parse OpenAI response: %s -- body: %s", e, resp.text)
+        return ""
+
+    if preprint and content and not content.lower().startswith("preprint:"):
+        content = "Preprint: " + content
+
     return truncate(clean_text(content), 240)
 
-# ---------- Posting ----------
+# ---------------- Posting (Tweepy) ----------------
+
 def make_twitter_client():
     api_key = os.environ.get("X_API_KEY")
     api_secret = os.environ.get("X_API_SECRET")
@@ -200,75 +290,102 @@ def craft_tweet(title: str, url: str, summary: str) -> str:
     if dh:
         tags.append(dh)
     tags.append(random.choice(FOCUS_HASHTAGS))
-    tweet = truncate(base, MAX_TWEET_LEN - (len(" ") + sum(len(t) + 1 for t in tags)))
+    # reserve space for tags
+    reserved = (len(" ") + sum(len(t) + 1 for t in tags))
+    tweet = truncate(base, MAX_TWEET_LEN - reserved)
     return tweet + " " + " ".join(tags)
 
-# ---------- Main ----------
-def run(max_posts=10, lang="en", post=False, source_keys=None, dry_run=False):
+# ---------------- Main routine ----------------
+
+def run(max_posts: int = 10, lang: str = "en", post: bool = False, source_keys: Optional[List[str]] = None, dry_run: bool = False):
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-    # Use the openai module and read API key from the environment
-    client = OpenAI()
+
+    # Allow runtime config overrides
+    load_config_overrides()
+
     conn = ensure_db()
 
     if source_keys is None or source_keys == ["all"]:
         source_keys = list(RSS_SOURCES.keys())
 
     items = gather_items(source_keys)
-    logging.info("Fetched %d candidate items", len(items))
+    logging.info("Fetched %d candidate items from %d sources", len(items), len(source_keys))
 
-    api = make_twitter_client() if post and not dry_run else None
+    api = None
+    if post and not dry_run:
+        api = make_twitter_client()
 
     posted = 0
-    for (title, link, key, published) in items:
+    now_ts = time.time()
+
+    for (title, link, key, published, feed_summary) in items:
         if posted >= max_posts:
             break
         if already_posted(conn, link):
             continue
 
-        article_text = fetch_article_text(link)
-        if len(article_text) < 300:
+        # Recency check already handled in allowed_by_policy, but skip if missing and too old
+        if published and (time.time() - published.timestamp()) > RECENCY_DAYS * 86400:
             continue
 
-        if not is_allowed(link, title, article_text, published):
+        article_text = fetch_article_text(link)
+        # fallback to feed summary if article fetch is too short
+        if len(article_text) < 300:
+            article_text = feed_summary or article_text
+
+        if len(article_text) < 100:
+            logging.debug("Skipping %s: insufficient article text", link)
             continue
+
+        if not allowed_by_policy(link, title, article_text, published):
+            logging.debug("Filtered by policy: %s", link)
+            continue
+
+        preprint = is_preprint(link)
 
         try:
-            summary = build_summary(client, title, article_text, link, lang)
+            summary = build_summary(title, article_text, link, lang=lang, preprint=preprint)
         except Exception as ex:
-            logging.warning("Summarization failed: %s", ex)
+            logging.warning("Summarization failed for %s: %s", link, ex)
+            logging.debug(traceback.format_exc())
             continue
 
-        if "arxiv.org" in link:
-            title = "[Preprint] " + title
+        if not summary:
+            logging.debug("Empty summary for %s, skipping", link)
+            continue
 
-        tweet = craft_tweet(title, link, summary)
+        t_title = ("[Preprint] " + title) if preprint else title
+        tweet = craft_tweet(t_title, link, summary)
 
         if dry_run or not post:
             print("\n--- TWEET PREVIEW ---\n" + tweet + "\n")
-            mark_posted(conn, link, title)
+            mark_posted(conn, link, t_title)
             posted += 1
             continue
 
         try:
             api.update_status(status=tweet)
-            mark_posted(conn, link, title)
+            mark_posted(conn, link, t_title)
             posted += 1
-            logging.info("Posted: %s", truncate(title, 80))
+            logging.info("Posted: %s", truncate(t_title, 80))
             time.sleep(random.uniform(8, 18))
         except Exception as ex:
-            logging.error("Posting failed: %s", ex)
+            logging.error("Posting failed for %s: %s", link, ex)
+            logging.debug(traceback.format_exc())
             continue
 
     logging.info("Done. Posted %d", posted)
 
+# ---------------- CLI ----------------
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--post", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--max", type=int, default=10)
-    ap.add_argument("--lang", type=str, default="en")
-    ap.add_argument("--sources", type=str, default="all")
+    ap.add_argument("--post", action="store_true", help="Actually post to X/Twitter")
+    ap.add_argument("--dry-run", action="store_true", help="Print tweets instead of posting")
+    ap.add_argument("--max", type=int, default=10, help="Number of posts (default 10)")
+    ap.add_argument("--lang", type=str, default="en", help="Summary language (default en)")
+    ap.add_argument("--sources", type=str, default="all", help="Comma-separated source keys (default all)")
     args = ap.parse_args()
 
     max_posts = max(1, min(15, args.max))
