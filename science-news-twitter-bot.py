@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup
 import tweepy
 from dotenv import load_dotenv
 import tldextract
-import openai
+from openai import OpenAI
 
 FOCUS_HASHTAGS = [
     "#AI", "#QuantumComputing", "#Fusion", "#Longevity", "#Aging", "#Neuroscience",
@@ -156,19 +156,31 @@ def gather_items(source_keys: List[str]):
     return uniq
 
 # ---------- Summarization ----------
-def build_summary(title: str, text: str, url: str, lang: str = "en") -> str:
-    prompt = f"""You are a concise science editor. Write exactly TWO sentences in {lang}. Be clear, neutral, and specific. Keep it under 220 characters if possible. Mention the domain (AI/quantum/fusion/longevity/BMI) when obvious, avoid hype. If source is a preprint, begin with 'Preprint:'.\nTitle: {title}\nArticle text:\n{text[:6000]}"""
-    # Use the openai module (classic ChatCompletion path) to avoid client constructor issues.
-    resp = openai.ChatCompletion.create(
-        model="gpt-5.1-mini",
+def build_summary(client: OpenAI, title: str, text: str, url: str, lang: str = "en") -> str:
+    prompt = (
+        f"You are a concise science editor. Write exactly TWO sentences in {lang}. "
+        "Be clear, neutral, and specific. Keep it under 220 characters if possible. "
+        "Mention the domain (AI/quantum/fusion/longevity/BMI) when obvious, avoid hype. "
+        "If source is a preprint, begin with 'Preprint:'.\n"
+        f"Title: {title}\nArticle text:\n{text[:6000]}"
+    )
+    resp = client.chat.completions.create(
+        model="gpt-3.5-turbo",   # safe fallback — change if you have access to a different model
         messages=[
             {"role": "system", "content": "You write crisp, factual science summaries in exactly two sentences."},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ],
         temperature=0.3,
         max_tokens=140,
     )
-    return truncate(clean_text(resp.choices[0].message.content), 240)
+
+    # response parsing for the OpenAI client
+    try:
+        content = resp.choices[0].message["content"]
+    except Exception:
+        # defensive — some SDK versions return different shapes
+        content = resp.choices[0].get("message", {}).get("content") or str(resp)
+    return truncate(clean_text(content), 240)
 
 # ---------- Posting ----------
 def make_twitter_client():
@@ -222,7 +234,7 @@ def run(max_posts=10, lang="en", post=False, source_keys=None, dry_run=False):
             continue
 
         try:
-            summary = build_summary(title, article_text, link, lang)
+            summary = build_summary(client, title, article_text, link, lang)
         except Exception as ex:
             logging.warning("Summarization failed: %s", ex)
             continue
