@@ -208,7 +208,7 @@ def run(max_posts=10, lang="en", post=False, source_keys=None, dry_run=False):
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     # Use the openai module and read API key from the environment
-    openai.api_key = os.environ.get("OPENAI_API_KEY")
+    client = OpenAI()
     conn = ensure_db()
 
     if source_keys is None or source_keys == ["all"]:
